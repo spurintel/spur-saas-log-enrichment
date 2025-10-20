@@ -1,0 +1,9 @@
+# SaaS IP Anomaly Detector - Dependencies
+
+# HTTP requests
+requests>=2.31.0
+
+# Optional: For loading credentials from .env files
+# Uncomment if you want to use python-dotenv
+# python-dotenv>=1.0.0
+

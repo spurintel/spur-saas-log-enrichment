@@ -1,0 +1,65 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+env/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Credentials and Secrets
+.env
+.env.local
+*.pem
+*.key
+credentials.json
+config.ini
+
+# API Tokens (be extra careful!)
+*token*
+*secret*
+*credentials*
+
+# Output files
+*.json
+reports/
+output/
+logs/
+
+# Suspicious IP lists (may contain sensitive data)
+suspicious_ips.txt
+blocklist.txt
+watchlist.txt
+iocs.txt
+
+# Exception: Allow example files
+!examples/*.json
+!examples/*.txt
+

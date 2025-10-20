@@ -1,0 +1,112 @@
+{
+  "generated_at": "2025-10-17T10:30:00.000000",
+  "summary": {
+    "slack_entries": 1487,
+    "zoom_entries": 892,
+    "total_anomalies": 23
+  },
+  "anomalies": [
+    {
+      "user": "alice",
+      "email": "alice@company.com",
+      "user_id": "U12345678",
+      "ip": "203.0.113.42",
+      "timestamp": "2025-10-15T14:23:11",
+      "action": "user_login",
+      "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+      "source": "slack",
+      "enrichment": {
+        "ip": "203.0.113.42",
+        "found": true,
+        "as": {
+          "number": 123456,
+          "organization": "Example VPN Provider"
+        },
+        "location": {
+          "country": "US",
+          "state": "NY",
+          "city": "New York"
+        },
+        "infrastructure": "vpn",
+        "vpn_operators": {
+          "NordVPN": [
+            "nord-vpn"
+          ]
+        },
+        "client": {
+          "types": [
+            "VPN"
+          ]
+        },
+        "risks": []
+      },
+      "anomaly_type": "VPN (NordVPN)",
+      "risk_score": 80
+    },
+    {
+      "user": "bob",
+      "email": "bob@company.com",
+      "user_id": "87654321",
+      "ip": "198.51.100.15",
+      "timestamp": "2025-10-16T09:15:43",
+      "action": "meeting_started",
+      "client_type": "Zoom Desktop Client",
+      "source": "zoom",
+      "enrichment": {
+        "ip": "198.51.100.15",
+        "found": true,
+        "as": {
+          "number": 789012,
+          "organization": "Cloud Hosting LLC"
+        },
+        "location": {
+          "country": "NL",
+          "city": "Amsterdam"
+        },
+        "infrastructure": "datacenter",
+        "client": {
+          "types": [
+            "DATACENTER"
+          ]
+        },
+        "risks": []
+      },
+      "anomaly_type": "Datacenter/Hosting",
+      "risk_score": 40
+    },
+    {
+      "user": "charlie",
+      "email": "charlie@company.com",
+      "user_id": "U87654321",
+      "ip": "192.0.2.100",
+      "timestamp": "2025-10-16T16:45:22",
+      "action": "file_downloaded",
+      "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+      "source": "slack",
+      "enrichment": {
+        "ip": "192.0.2.100",
+        "found": true,
+        "as": {
+          "number": 345678,
+          "organization": "Privacy Services Inc"
+        },
+        "location": {
+          "country": "CH",
+          "city": "Zurich"
+        },
+        "infrastructure": "proxy",
+        "client": {
+          "types": [
+            "PROXY"
+          ]
+        },
+        "risks": [
+          "CALLBACK_PROXY"
+        ]
+      },
+      "anomaly_type": "Proxy",
+      "risk_score": 70
+    }
+  ]
+}
+
