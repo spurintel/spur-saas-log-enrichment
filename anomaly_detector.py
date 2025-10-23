@@ -17,16 +17,31 @@ from extractors.zoom_extractor import ZoomExtractor
 
 class AnomalyDetector:
     """Main class for detecting IP anomalies in SaaS logs."""
-    
+
     # Critical VPN/Proxy operators to alert on in CLI output
     # Edit this list to add/remove operators that require immediate attention
-    CRITICAL_OPERATORS = ['ASTRILL_VPN', 'PROXYSOCKS5_PROXY']
-    
+    CRITICAL_OPERATORS = ['ASTRILL_VPN',
+                          'PROXYSOCKS5_PROXY',
+                          'SHADOW_TECH_VDI',
+                          'GLKVM_VDI',
+                          'KASM_VDI',
+                          'DIGIRDP_VDI',
+                          'OPENAI_VDI',
+                          'PAPERSPACE_VDI',
+                          'NANOKVM_VDI',
+                          'PIKVM_VDI',
+                          'BROWSERLING_VDI',
+                          'SHELLS_VDI',
+                          'GENYMOTION_VDI',
+                          'TINYPILOT_VDI',
+                          'JETKVM_VDI',
+                          'SILO_VDI']
+
     def __init__(self):
         self.slack_data = []
         self.zoom_data = []
         self.anomalies = []
-    
+
     def extract_slack_data(self, api_token: str, days: int = 30) -> List[Dict]:
         """Extract IP addresses and user data from Slack."""
         print(f"📥 Extracting Slack data for the last {days} days...")
@@ -34,7 +49,7 @@ class AnomalyDetector:
         self.slack_data = extractor.extract_ip_logs(days)
         print(f"✅ Extracted {len(self.slack_data)} Slack entries")
         return self.slack_data
-    
+
     def extract_zoom_data(self, account_id: str, client_id: str, client_secret: str, days: int = 30) -> List[Dict]:
         """Extract IP addresses and user data from Zoom."""
         print(f"📥 Extracting Zoom data for the last {days} days...")
@@ -42,36 +57,37 @@ class AnomalyDetector:
         self.zoom_data = extractor.extract_ip_logs(days)
         print(f"✅ Extracted {len(self.zoom_data)} Zoom entries")
         return self.zoom_data
-    
+
     def enrich_with_spur(self, api_token: str, reports_dir: str = "reports") -> List[Dict]:
         """Enrich IP data using Spur Context API to detect VPNs and tunnels."""
         print(f"\n🔍 Enriching data with Spur API...")
         enricher = SpurEnrichment(api_token, reports_dir)
-        
+
         all_data = [
             {**entry, 'source': 'slack'} for entry in self.slack_data
         ] + [
             {**entry, 'source': 'zoom'} for entry in self.zoom_data
         ]
-        
+
         self.anomalies = enricher.enrich_and_detect(all_data)
         return self.anomalies
-    
+
     def enrich_with_file(self, filepath: str) -> List[Dict]:
         """Enrich IP data using a file containing suspicious IP addresses."""
         print(f"🔍 Enriching data with IP list from {filepath}...")
         enricher = FileEnrichment(filepath)
-        
+
         all_data = [
             {**entry, 'source': 'slack'} for entry in self.slack_data
         ] + [
             {**entry, 'source': 'zoom'} for entry in self.zoom_data
         ]
-        
+
         self.anomalies = enricher.enrich_and_detect(all_data)
-        print(f"⚠️  Found {len(self.anomalies)} anomalies (matched suspicious IPs)")
+        print(
+            f"⚠️  Found {len(self.anomalies)} anomalies (matched suspicious IPs)")
         return self.anomalies
-    
+
     def generate_report(self, output_file: str = None):
         """Generate a detailed report of findings."""
         report = {
@@ -83,49 +99,74 @@ class AnomalyDetector:
             },
             'anomalies': self.anomalies
         }
-        
+
         if output_file:
             with open(output_file, 'w') as f:
                 json.dump(report, f, indent=2)
             print(f"\n✓ Anomaly report saved to {output_file}")
-        
+
         # Filter anomalies for critical operators only (for CLI display)
         critical_anomalies = [
-            a for a in self.anomalies 
+            a for a in self.anomalies
             if a.get('vpn_operator') in self.CRITICAL_OPERATORS
         ]
-        
-        # Print minimal summary to console (no PII unless critical)
-        print(f"\n{'='*60}")
-        print(f"DETECTION SUMMARY")
-        print(f"{'='*60}")
-        print(f"Entries analyzed: {report['summary']['slack_entries'] + report['summary']['zoom_entries']}")
-        print(f"Anonymous VPN detections: {report['summary']['total_anomalies']}")
-        print(f"Critical alerts (displayed): {len(critical_anomalies)}")
-        
+
+        # Count and display critical alerts with deduplication
+        displayed_count = 0
+        displayed_alerts = []
+
         if critical_anomalies:
-            print(f"\n{'='*60}")
-            print(f"🚨 CRITICAL VPN/PROXY DETECTIONS")
-            print(f"{'='*60}")
-            
-            # Track Slack users we've already shown to avoid duplicates
+            # Track users we've already shown to avoid duplicates
             slack_users_shown = set()
-            
+            zoom_users_shown = set()
+
             for anomaly in critical_anomalies:
                 user = anomaly.get('user') or anomaly.get('email', 'Unknown')
                 vpn_operator = anomaly.get('vpn_operator', 'Unknown')
                 source = anomaly.get('source', 'Unknown')
-                
+
                 # For Slack, skip if we've already shown this user
                 if source == 'slack':
                     user_key = anomaly.get('email', user)
                     if user_key in slack_users_shown:
                         continue
                     slack_users_shown.add(user_key)
-                
+
+                # For Zoom, skip if we've already shown this user+meeting combination
+                if source == 'zoom':
+                    zoom_key = (anomaly.get('email', user),
+                                anomaly.get('meeting_topic', ''))
+                    if zoom_key in zoom_users_shown:
+                        continue
+                    zoom_users_shown.add(zoom_key)
+
+                # This alert will be displayed, so add it to our list
+                displayed_alerts.append(anomaly)
+                displayed_count += 1
+
+        # Print minimal summary to console (no PII unless critical)
+        print(f"\n{'='*60}")
+        print(f"DETECTION SUMMARY")
+        print(f"{'='*60}")
+        print(
+            f"Entries analyzed: {report['summary']['slack_entries'] + report['summary']['zoom_entries']}")
+        print(
+            f"Anonymous VPN detections: {report['summary']['total_anomalies']}")
+        print(f"Critical alerts (displayed): {displayed_count}")
+
+        if displayed_alerts:
+            print(f"\n{'='*60}")
+            print(f"🚨 CRITICAL VPN/PROXY DETECTIONS")
+            print(f"{'='*60}")
+
+            for anomaly in displayed_alerts:
+                user = anomaly.get('user') or anomaly.get('email', 'Unknown')
+                vpn_operator = anomaly.get('vpn_operator', 'Unknown')
+                source = anomaly.get('source', 'Unknown')
+
                 # Format operator name (e.g., MULLVAD_VPN -> Mullvad VPN)
                 vpn_name = vpn_operator.replace('_', ' ').title()
-                
+
                 # For Zoom, include meeting name
                 if source == 'zoom' and anomaly.get('meeting_topic'):
                     meeting_name = anomaly.get('meeting_topic')
@@ -141,10 +182,11 @@ class AnomalyDetector:
                     print()
         else:
             print("\n✓ No critical VPN/proxy detections")
-        
+
         if report['summary']['total_anomalies'] > len(critical_anomalies):
-            print(f"Note: {report['summary']['total_anomalies'] - len(critical_anomalies)} other VPN detections saved to report (not critical)")
-        
+            print(
+                f"Note: {report['summary']['total_anomalies'] - len(critical_anomalies)} other VPN detections saved to report (not critical)")
+
         print(f"{'='*60}\n")
         return report
 
@@ -167,47 +209,54 @@ Examples:
     --output report.json
         """
     )
-    
+
     # Data extraction arguments
     parser.add_argument('--slack-token', help='Slack API token')
     parser.add_argument('--zoom-account-id', help='Zoom Account ID')
     parser.add_argument('--zoom-client-id', help='Zoom Client ID')
     parser.add_argument('--zoom-client-secret', help='Zoom Client Secret')
-    parser.add_argument('--days', type=int, default=30, help='Number of days to analyze (default: 30)')
-    
+    parser.add_argument('--days', type=int, default=30,
+                        help='Number of days to analyze (default: 30)')
+
     # Enrichment arguments
     parser.add_argument('--enrichment', choices=['spur', 'file'], required=True,
-                       help='Enrichment method: spur (API) or file (IP list)')
-    parser.add_argument('--spur-token', help='Spur Context API token (required for spur enrichment)')
-    parser.add_argument('--ip-file', help='Path to file with suspicious IPs (required for file enrichment)')
-    
+                        help='Enrichment method: spur (API) or file (IP list)')
+    parser.add_argument(
+        '--spur-token', help='Spur Context API token (required for spur enrichment)')
+    parser.add_argument(
+        '--ip-file', help='Path to file with suspicious IPs (required for file enrichment)')
+
     # Output arguments
-    parser.add_argument('--output', help='Output file for JSON report (optional, defaults to reports/anomaly_report_YYYYMMDD.json)')
-    parser.add_argument('--reports-dir', default='reports', help='Directory for reports (default: reports)')
-    
+    parser.add_argument(
+        '--output', help='Output file for JSON report (optional, defaults to reports/anomaly_report_YYYYMMDD.json)')
+    parser.add_argument('--reports-dir', default='reports',
+                        help='Directory for reports (default: reports)')
+
     args = parser.parse_args()
-    
+
     # Validate arguments
     if not args.slack_token and not args.zoom_account_id:
-        parser.error("At least one data source (--slack-token or --zoom-account-id) must be provided")
-    
+        parser.error(
+            "At least one data source (--slack-token or --zoom-account-id) must be provided")
+
     if args.zoom_account_id and not (args.zoom_client_id and args.zoom_client_secret):
-        parser.error("--zoom-client-id and --zoom-client-secret are required when using --zoom-account-id")
-    
+        parser.error(
+            "--zoom-client-id and --zoom-client-secret are required when using --zoom-account-id")
+
     if args.enrichment == 'spur' and not args.spur_token:
         parser.error("--spur-token is required when using spur enrichment")
-    
+
     if args.enrichment == 'file' and not args.ip_file:
         parser.error("--ip-file is required when using file enrichment")
-    
+
     # Run detection
     detector = AnomalyDetector()
-    
+
     try:
         # Extract data
         if args.slack_token:
             detector.extract_slack_data(args.slack_token, args.days)
-        
+
         if args.zoom_account_id:
             detector.extract_zoom_data(
                 args.zoom_account_id,
@@ -215,21 +264,21 @@ Examples:
                 args.zoom_client_secret,
                 args.days
             )
-        
+
         # Enrich data
         if args.enrichment == 'spur':
             detector.enrich_with_spur(args.spur_token, args.reports_dir)
         elif args.enrichment == 'file':
             detector.enrich_with_file(args.ip_file)
-        
+
         # Generate report with default filename if not specified
         output_file = args.output
         if not output_file:
             timestamp = datetime.now(timezone.utc).strftime('%Y%m%d')
             output_file = f"{args.reports_dir}/anomaly_report_{timestamp}.json"
-        
+
         detector.generate_report(output_file)
-        
+
     except Exception as e:
         print(f"❌ Error: {str(e)}", file=sys.stderr)
         sys.exit(1)
@@ -237,4 +286,3 @@ Examples:
 
 if __name__ == '__main__':
     main()
-

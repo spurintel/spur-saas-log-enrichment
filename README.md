@@ -230,6 +230,25 @@ export SLACK_API_TOKEN="xoxp-xxx"
 - **Slack API**: ~1 request/second (built-in rate limiting)
 - **Zoom API**: ~3 requests/second (built-in rate limiting)
 
+## Performance Optimization
+
+The Spur enrichment uses **parallel API requests** for high performance:
+- **Default**: 50 concurrent workers
+- Typical speed: ~50 IPs/second (depending on network and API response time)
+- Adjustable via the `max_workers` parameter in code:
+
+```python
+from enrichment.spur_enrichment import SpurEnrichment
+
+# Use more workers for faster processing (if your API plan allows)
+enricher = SpurEnrichment(api_token, reports_dir="reports", max_workers=100)
+
+# Or fewer workers for rate-limited plans
+enricher = SpurEnrichment(api_token, reports_dir="reports", max_workers=25)
+```
+
+**Note**: The Spur API supports high concurrency. If you have a large number of IPs to check, increasing `max_workers` to 100+ can significantly speed up processing.
+
 ## Plan Limitations
 
 | Service | Free/Pro | Standard/Plus | Business/Enterprise |

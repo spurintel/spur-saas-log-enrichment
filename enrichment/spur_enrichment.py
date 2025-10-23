@@ -1,10 +1,10 @@
 """Spur Context API enrichment for detecting VPNs, proxies, and tunnels."""
 
-import time
 import json
 import os
 from datetime import datetime, timezone
-from typing import Dict, List, Set
+from typing import Dict, List
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 
 
@@ -13,13 +13,14 @@ class SpurEnrichment:
     
     BASE_URL = "https://api.spur.us/v2/context"
     
-    def __init__(self, api_token: str, reports_dir: str = "reports"):
+    def __init__(self, api_token: str, reports_dir: str = "reports", max_workers: int = 50):
         """
         Initialize Spur enrichment.
         
         Args:
             api_token: Spur Context API token
             reports_dir: Directory to store reports (default: "reports")
+            max_workers: Maximum concurrent API requests (default: 50)
         """
         self.api_token = api_token
         self.headers = {
@@ -28,6 +29,7 @@ class SpurEnrichment:
         }
         self.cache = {}  # Cache results to avoid duplicate API calls
         self.reports_dir = reports_dir
+        self.max_workers = max_workers
         
         # Create reports directory if it doesn't exist
         os.makedirs(self.reports_dir, exist_ok=True)
@@ -46,19 +48,29 @@ class SpurEnrichment:
         all_enriched_data = []
         
         # Get unique IPs to reduce API calls
-        unique_ips = set(entry['ip'] for entry in log_entries if entry.get('ip'))
+        unique_ips = list(set(entry['ip'] for entry in log_entries if entry.get('ip')))
         print(f"   Analyzing {len(unique_ips)} unique IP addresses with Spur API...")
+        print(f"   Using {self.max_workers} concurrent workers for parallel lookups...")
         
-        # Enrich each unique IP
-        for idx, ip in enumerate(unique_ips, 1):
-            if idx % 50 == 0:
-                print(f"   Progress: {idx}/{len(unique_ips)} IPs analyzed")
+        # Enrich IPs in parallel using ThreadPoolExecutor
+        completed = 0
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            # Submit all tasks
+            future_to_ip = {executor.submit(self._enrich_ip, ip): ip for ip in unique_ips}
             
-            enrichment = self._enrich_ip(ip)
-            self.cache[ip] = enrichment
-            
-            # Rate limiting - 100 requests per second
-            time.sleep(0.01)
+            # Process completed tasks as they finish
+            for future in as_completed(future_to_ip):
+                ip = future_to_ip[future]
+                try:
+                    enrichment = future.result()
+                    self.cache[ip] = enrichment
+                except Exception as e:
+                    # Handle any exceptions from the thread
+                    self.cache[ip] = {'ip': ip, 'found': False, 'error': str(e)}
+                
+                completed += 1
+                if completed % 50 == 0 or completed == len(unique_ips):
+                    print(f"   Progress: {completed}/{len(unique_ips)} IPs analyzed")
         
         # Now check all entries against enriched data
         for entry in log_entries:
