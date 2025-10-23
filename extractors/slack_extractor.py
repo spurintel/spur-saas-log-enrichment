@@ -3,6 +3,7 @@
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List
+from collections import deque
 import requests
 
 
@@ -10,6 +11,8 @@ class SlackExtractor:
     """Extract IP addresses and user information from Slack access logs."""
     
     BASE_URL = "https://slack.com/api"
+    MAX_REQUESTS_PER_MINUTE = 20
+    RATE_LIMIT_WINDOW = 60  # seconds
     
     def __init__(self, api_token: str):
         """
@@ -25,6 +28,96 @@ class SlackExtractor:
             'Content-Type': 'application/json'
         }
         self.user_cache = {}
+        # Track request timestamps for rate limiting
+        self.request_times = deque()
+    
+    def _enforce_rate_limit(self):
+        """Enforce rate limit of 20 requests per minute."""
+        current_time = time.time()
+        
+        # Remove timestamps older than 60 seconds
+        while self.request_times and current_time - self.request_times[0] > self.RATE_LIMIT_WINDOW:
+            self.request_times.popleft()
+        
+        # If we've hit the limit, wait until we can make another request
+        if len(self.request_times) >= self.MAX_REQUESTS_PER_MINUTE:
+            oldest_request = self.request_times[0]
+            sleep_time = self.RATE_LIMIT_WINDOW - (current_time - oldest_request)
+            if sleep_time > 0:
+                print(f"   Rate limit reached, waiting {sleep_time:.1f}s...")
+                time.sleep(sleep_time)
+                # Clean up old timestamps after sleeping
+                current_time = time.time()
+                while self.request_times and current_time - self.request_times[0] > self.RATE_LIMIT_WINDOW:
+                    self.request_times.popleft()
+        
+        # Record this request
+        self.request_times.append(time.time())
+    
+    def _make_request_with_backoff(self, url: str, params: Dict = None, timeout: int = 30, max_retries: int = 5) -> requests.Response:
+        """
+        Make a request with exponential backoff for 429 errors.
+        
+        Args:
+            url: The URL to request
+            params: Request parameters
+            timeout: Request timeout in seconds
+            max_retries: Maximum number of retry attempts
+            
+        Returns:
+            Response object
+            
+        Raises:
+            Exception: If request fails after all retries
+        """
+        retry_count = 0
+        base_delay = 1  # Start with 1 second delay
+        
+        while retry_count <= max_retries:
+            # Enforce our rate limit before making request
+            self._enforce_rate_limit()
+            
+            try:
+                response = requests.get(
+                    url,
+                    headers=self.headers,
+                    params=params,
+                    timeout=timeout
+                )
+                
+                # Handle rate limiting (429)
+                if response.status_code == 429:
+                    retry_after = response.headers.get('Retry-After')
+                    
+                    if retry_after:
+                        # Use the Retry-After header if provided
+                        wait_time = int(retry_after)
+                    else:
+                        # Exponential backoff: 1s, 2s, 4s, 8s, 16s
+                        wait_time = base_delay * (2 ** retry_count)
+                    
+                    retry_count += 1
+                    
+                    if retry_count > max_retries:
+                        raise Exception(f"Rate limit exceeded after {max_retries} retries")
+                    
+                    print(f"   ⚠️  Rate limited (429), waiting {wait_time}s before retry {retry_count}/{max_retries}...")
+                    time.sleep(wait_time)
+                    continue
+                
+                response.raise_for_status()
+                return response
+                
+            except requests.exceptions.RequestException as e:
+                if retry_count >= max_retries:
+                    raise
+                
+                retry_count += 1
+                wait_time = base_delay * (2 ** retry_count)
+                print(f"   ⚠️  Request failed, retrying in {wait_time}s... ({retry_count}/{max_retries})")
+                time.sleep(wait_time)
+        
+        raise Exception(f"Request failed after {max_retries} retries")
     
     def _get_user_info(self, user_id: str) -> Dict:
         """Get user information from cache or API."""
@@ -32,13 +125,11 @@ class SlackExtractor:
             return self.user_cache[user_id]
         
         try:
-            response = requests.get(
+            response = self._make_request_with_backoff(
                 f"{self.BASE_URL}/users.info",
-                headers=self.headers,
                 params={'user': user_id},
                 timeout=10
             )
-            response.raise_for_status()
             data = response.json()
             
             if data.get('ok') and data.get('user'):
@@ -89,13 +180,11 @@ class SlackExtractor:
             }
             
             try:
-                response = requests.get(
+                response = self._make_request_with_backoff(
                     f"{self.BASE_URL}/team.accessLogs",
-                    headers=self.headers,
                     params=params,
                     timeout=30
                 )
-                response.raise_for_status()
                 data = response.json()
                 
                 if not data.get('ok'):
@@ -177,9 +266,6 @@ class SlackExtractor:
                 if current_page >= total_pages:
                     break
                 
-                # Rate limiting: be nice to the API
-                time.sleep(0.5)
-                
             except requests.exceptions.RequestException as e:
                 raise Exception(f"Failed to fetch Slack access logs: {str(e)}")
         
@@ -190,25 +276,21 @@ class SlackExtractor:
         """Test if the API token is valid and has necessary permissions."""
         try:
             # Test auth.test first to verify token is valid
-            response = requests.get(
+            response = self._make_request_with_backoff(
                 f"{self.BASE_URL}/auth.test",
-                headers=self.headers,
                 timeout=10
             )
-            response.raise_for_status()
             data = response.json()
             
             if not data.get('ok'):
                 return False
             
             # Now test team.accessLogs with minimal request
-            response = requests.get(
+            response = self._make_request_with_backoff(
                 f"{self.BASE_URL}/team.accessLogs",
-                headers=self.headers,
                 params={'count': 1},
                 timeout=10
             )
-            response.raise_for_status()
             data = response.json()
             
             return data.get('ok', False)
