@@ -1,7 +1,8 @@
 """File-based IP enrichment for detecting known suspicious IPs."""
 
-from typing import Dict, List, Set
+from typing import Dict, List
 import os
+import csv
 
 
 class FileEnrichment:
@@ -12,24 +13,26 @@ class FileEnrichment:
         Initialize file-based enrichment.
         
         Args:
-            filepath: Path to newline-delimited file of suspicious IPs
+            filepath: Path to CSV file of suspicious IPs with columns: ip, operator
         """
         self.filepath = filepath
         self.suspicious_ips = self._load_suspicious_ips()
     
-    def _load_suspicious_ips(self) -> Set[str]:
-        """Load suspicious IPs from file into a set for fast lookup."""
+    def _load_suspicious_ips(self) -> Dict[str, str]:
+        """Load suspicious IPs from CSV file into a dict mapping IP -> operator/tag."""
         if not os.path.exists(self.filepath):
             raise FileNotFoundError(f"Suspicious IP file not found: {self.filepath}")
         
-        suspicious = set()
+        suspicious = {}
         
         with open(self.filepath, 'r') as f:
-            for line in f:
-                ip = line.strip()
-                # Skip empty lines and comments
-                if ip and not ip.startswith('#'):
-                    suspicious.add(ip)
+            reader = csv.DictReader(f)
+            for row in reader:
+                ip = row.get('ip', '').strip()
+                operator = row.get('operator', '').strip()
+                # Skip empty IPs
+                if ip:
+                    suspicious[ip] = operator
         
         print(f"   Loaded {len(suspicious)} suspicious IPs from {self.filepath}")
         return suspicious
@@ -51,21 +54,32 @@ class FileEnrichment:
         print(f"   Analyzing {len(unique_ips)} unique IP addresses against watchlist...")
         
         # Find matching IPs
-        matching_ips = unique_ips & self.suspicious_ips
+        matching_ips = unique_ips & self.suspicious_ips.keys()
         print(f"   Found {len(matching_ips)} IPs matching the suspicious list")
+        
+        # Print matching IPs with their tags
+        if matching_ips:
+            print("\n   Offending IPs detected:")
+            for ip in sorted(matching_ips):
+                tag = self.suspicious_ips[ip]
+                print(f"      - IP: {ip} | Tag: {tag}")
+            print()
         
         # Build anomalies list
         for entry in log_entries:
             ip = entry.get('ip')
-            if ip and ip in matching_ips:
+            if ip and ip in self.suspicious_ips:
+                operator_tag = self.suspicious_ips[ip]
                 anomaly = {
                     **entry,
+                    'vpn_operator': operator_tag,  # Add top-level field for critical alert detection
                     'enrichment': {
                         'ip': ip,
                         'matched': True,
-                        'source': 'suspicious_ip_list'
+                        'source': 'suspicious_ip_list',
+                        'operator': operator_tag
                     },
-                    'anomaly_type': 'Suspicious IP (Watchlist Match)',
+                    'anomaly_type': f'Suspicious IP (Watchlist Match - {operator_tag})',
                     'risk_score': 90  # High risk since it's on a known bad list
                 }
                 anomalies.append(anomaly)
