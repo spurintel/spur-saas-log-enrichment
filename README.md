@@ -24,7 +24,7 @@ Detect anonymous VPN tunnels and suspicious IP addresses in your Slack and Zoom 
 
 ```bash
 git clone https://github.com/spurintel/spur-saas-log-enrichment.git
-cd saas-enrichment
+cd spur-saas-log-enrichment
 pip install -r requirements.txt
 ```
 
