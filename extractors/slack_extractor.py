@@ -3,7 +3,6 @@
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List
-from collections import deque
 import requests
 
 
@@ -28,33 +27,8 @@ class SlackExtractor:
             'Content-Type': 'application/json'
         }
         self.user_cache = {}
-        # Track request timestamps for rate limiting
-        self.request_times = deque()
     
-    def _enforce_rate_limit(self):
-        """Enforce rate limit of 20 requests per minute."""
-        current_time = time.time()
-        
-        # Remove timestamps older than 60 seconds
-        while self.request_times and current_time - self.request_times[0] > self.RATE_LIMIT_WINDOW:
-            self.request_times.popleft()
-        
-        # If we've hit the limit, wait until we can make another request
-        if len(self.request_times) >= self.MAX_REQUESTS_PER_MINUTE:
-            oldest_request = self.request_times[0]
-            sleep_time = self.RATE_LIMIT_WINDOW - (current_time - oldest_request)
-            if sleep_time > 0:
-                print(f"   Rate limit reached, waiting {sleep_time:.1f}s...")
-                time.sleep(sleep_time)
-                # Clean up old timestamps after sleeping
-                current_time = time.time()
-                while self.request_times and current_time - self.request_times[0] > self.RATE_LIMIT_WINDOW:
-                    self.request_times.popleft()
-        
-        # Record this request
-        self.request_times.append(time.time())
-    
-    def _make_request_with_backoff(self, url: str, params: Dict = None, timeout: int = 30, max_retries: int = 5) -> requests.Response:
+    def _make_request_with_backoff(self, url: str, params: Dict = None, timeout: int = 30, max_retries: int = 5, enforce_rate_limit: bool = False) -> requests.Response:
         """
         Make a request with exponential backoff for 429 errors.
         
@@ -63,6 +37,7 @@ class SlackExtractor:
             params: Request parameters
             timeout: Request timeout in seconds
             max_retries: Maximum number of retry attempts
+            enforce_rate_limit: If True, adds a delay to respect rate limits (for pagination)
             
         Returns:
             Response object
@@ -74,8 +49,9 @@ class SlackExtractor:
         base_delay = 1  # Start with 1 second delay
         
         while retry_count <= max_retries:
-            # Enforce our rate limit before making request
-            self._enforce_rate_limit()
+            # Add a small delay for rate limiting if requested (only for pagination requests)
+            if enforce_rate_limit and retry_count == 0:
+                time.sleep(self.RATE_LIMIT_WINDOW / self.MAX_REQUESTS_PER_MINUTE)
             
             try:
                 response = requests.get(
@@ -183,7 +159,8 @@ class SlackExtractor:
                 response = self._make_request_with_backoff(
                     f"{self.BASE_URL}/team.accessLogs",
                     params=params,
-                    timeout=30
+                    timeout=30,
+                    enforce_rate_limit=(page > 1)  # Rate limit after first page
                 )
                 data = response.json()
                 
