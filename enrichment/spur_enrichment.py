@@ -2,6 +2,7 @@
 
 import json
 import os
+import time
 from datetime import datetime, timezone
 from typing import Dict, List
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -13,20 +14,24 @@ class SpurEnrichment:
     
     BASE_URL = "https://api.spur.us/v2/context"
     
-    def __init__(self, api_token: str, reports_dir: str = "reports", max_workers: int = 50):
+    def __init__(self, api_token: str, reports_dir: str = "reports", max_workers: int = 200):
         """
         Initialize Spur enrichment.
         
         Args:
             api_token: Spur Context API token
             reports_dir: Directory to store reports (default: "reports")
-            max_workers: Maximum concurrent API requests (default: 50)
+            max_workers: Maximum concurrent API requests (default: 200)
         """
         self.api_token = api_token
         self.headers = {
             'Token': api_token,
             'Content-Type': 'application/json'
         }
+        # Connection reuse; pool sized to the worker count
+        self.session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(pool_connections=max_workers, pool_maxsize=max_workers)
+        self.session.mount('https://', adapter)
         self.cache = {}  # Cache results to avoid duplicate API calls
         self.reports_dir = reports_dir
         self.max_workers = max_workers
@@ -112,12 +117,19 @@ class SpurEnrichment:
             Dict with enrichment data
         """
         try:
-            response = requests.get(
-                f"{self.BASE_URL}/{ip}",
-                headers=self.headers,
-                timeout=10
-            )
-            
+            # Retry on 429 — without this a rate-limited lookup would be
+            # silently recorded as found=False, i.e. a clean IP (false negative)
+            for attempt in range(5):
+                response = self.session.get(
+                    f"{self.BASE_URL}/{ip}",
+                    headers=self.headers,
+                    timeout=10
+                )
+                if response.status_code != 429:
+                    break
+                retry_after = response.headers.get('Retry-After')
+                time.sleep(int(retry_after) if retry_after and retry_after.isdigit() else 2 ** attempt)
+
             if response.status_code == 404:
                 # IP not in Spur database
                 return {'ip': ip, 'found': False}
