@@ -6,9 +6,11 @@ Extracts IP addresses from Slack and Zoom logs and detects anomalies using vario
 
 import argparse
 import json
+import os
 import sys
 from datetime import datetime, timezone
 from typing import Dict, List, Set
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from enrichment.spur_enrichment import SpurEnrichment
 from enrichment.file_enrichment import FileEnrichment
 from extractors.slack_extractor import SlackExtractor
@@ -101,6 +103,7 @@ class AnomalyDetector:
         }
 
         if output_file:
+            os.makedirs(os.path.dirname(output_file) or '.', exist_ok=True)
             with open(output_file, 'w') as f:
                 json.dump(report, f, indent=2)
             print(f"\n✓ Anomaly report saved to {output_file}")
@@ -210,11 +213,15 @@ Examples:
         """
     )
 
-    # Data extraction arguments
-    parser.add_argument('--slack-token', help='Slack API token')
-    parser.add_argument('--zoom-account-id', help='Zoom Account ID')
-    parser.add_argument('--zoom-client-id', help='Zoom Client ID')
-    parser.add_argument('--zoom-client-secret', help='Zoom Client Secret')
+    # Data extraction arguments (fall back to env vars so secrets stay out of the process list)
+    parser.add_argument('--slack-token', default=os.environ.get('SLACK_API_TOKEN'),
+                        help='Slack API token (env: SLACK_API_TOKEN)')
+    parser.add_argument('--zoom-account-id', default=os.environ.get('ZOOM_ACCOUNT_ID'),
+                        help='Zoom Account ID (env: ZOOM_ACCOUNT_ID)')
+    parser.add_argument('--zoom-client-id', default=os.environ.get('ZOOM_CLIENT_ID'),
+                        help='Zoom Client ID (env: ZOOM_CLIENT_ID)')
+    parser.add_argument('--zoom-client-secret', default=os.environ.get('ZOOM_CLIENT_SECRET'),
+                        help='Zoom Client Secret (env: ZOOM_CLIENT_SECRET)')
     parser.add_argument('--days', type=int, default=30,
                         help='Number of days to analyze (default: 30)')
 
@@ -222,7 +229,8 @@ Examples:
     parser.add_argument('--enrichment', choices=['spur', 'file'], required=True,
                         help='Enrichment method: spur (API) or file (IP list)')
     parser.add_argument(
-        '--spur-token', help='Spur Context API token (required for spur enrichment)')
+        '--spur-token', default=os.environ.get('SPUR_API_TOKEN'),
+        help='Spur Context API token (required for spur enrichment, env: SPUR_API_TOKEN)')
     parser.add_argument(
         '--ip-file', help='Path to file with suspicious IPs (required for file enrichment)')
 
@@ -252,32 +260,53 @@ Examples:
     # Run detection
     detector = AnomalyDetector()
 
+    # Default report filename if not specified
+    output_file = args.output
+    if not output_file:
+        timestamp = datetime.now(timezone.utc).strftime('%Y%m%d')
+        output_file = f"{args.reports_dir}/anomaly_report_{timestamp}.json"
+
     try:
-        # Extract data
-        if args.slack_token:
-            detector.extract_slack_data(args.slack_token, args.days)
+        # Extract data in parallel
+        with ThreadPoolExecutor() as executor:
+            futures = []
 
-        if args.zoom_account_id:
-            detector.extract_zoom_data(
-                args.zoom_account_id,
-                args.zoom_client_id,
-                args.zoom_client_secret,
-                args.days
-            )
+            if args.slack_token:
+                futures.append(
+                    executor.submit(
+                        detector.extract_slack_data,
+                        args.slack_token,
+                        args.days
+                    )
+                )
 
-        # Enrich data
+            if args.zoom_account_id:
+                futures.append(
+                    executor.submit(
+                        detector.extract_zoom_data,
+                        args.zoom_account_id,
+                        args.zoom_client_id,
+                        args.zoom_client_secret,
+                        args.days
+                    )
+                )
+
+            # File enrichment is a cheap local lookup, so write an interim
+            # report as each source finishes instead of waiting for both.
+            done = 0
+            for future in as_completed(futures):
+                future.result()
+                done += 1
+                if args.enrichment == 'file':
+                    if done < len(futures):
+                        print(f"\n📝 Writing interim report ({done}/{len(futures)} sources done)...")
+                    detector.enrich_with_file(args.ip_file)
+                    detector.generate_report(output_file)
+
+        # Spur enrichment costs API calls per IP — run it once, after all sources
         if args.enrichment == 'spur':
             detector.enrich_with_spur(args.spur_token, args.reports_dir)
-        elif args.enrichment == 'file':
-            detector.enrich_with_file(args.ip_file)
-
-        # Generate report with default filename if not specified
-        output_file = args.output
-        if not output_file:
-            timestamp = datetime.now(timezone.utc).strftime('%Y%m%d')
-            output_file = f"{args.reports_dir}/anomaly_report_{timestamp}.json"
-
-        detector.generate_report(output_file)
+            detector.generate_report(output_file)
 
     except Exception as e:
         print(f"❌ Error: {str(e)}", file=sys.stderr)
