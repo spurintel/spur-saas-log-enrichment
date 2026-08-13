@@ -4,6 +4,7 @@ import base64
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 
 
@@ -26,6 +27,10 @@ class ZoomExtractor:
         self.client_id = client_id
         self.client_secret = client_secret
         self.access_token = None
+        # Connection reuse; pool sized for the participant-fetch worker count
+        self.session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=20)
+        self.session.mount('https://', adapter)
     
     def _get_access_token(self) -> str:
         """Get OAuth access token using Server-to-Server OAuth."""
@@ -87,84 +92,96 @@ class ZoomExtractor:
         
         # Step 1: Get list of past meetings
         meetings = self._get_past_meetings(start_date, end_date)
+
+        # Step 2: Fetch participants for all meetings in parallel
         print(f"   Fetching {len(meetings)} Zoom meetings...")
         
-        # Step 2: For each meeting, get participants with IP addresses
-        for idx, meeting in enumerate(meetings, 1):
+        def fetch_participants(meeting):
             meeting_id = meeting['id']
             meeting_topic = meeting.get('topic', 'Unknown')
-            if idx % 10 == 0 or idx == len(meetings):
-                print(f"   Processing meeting {idx}/{len(meetings)}...")
-            
-            participants = self._get_meeting_participants(meeting_id)
-            
-            for participant in participants:
-                ip_address = participant.get('ip_address')
-                if not ip_address:
-                    continue
-                
-                # Get user name and email with proper fallbacks
-                user_name = participant.get('user_name', participant.get('name', 'Unknown'))
-                user_email = participant.get('user_email', participant.get('email', ''))
-                
-                # If no email, check if user_name is an email
-                if not user_email and '@' in user_name:
-                    user_email = user_name
-                elif not user_email:
-                    user_email = 'Unknown'
-                
-                # For display name, use the part before @ if it's an email, otherwise use as-is
-                display_name = user_name.split('@')[0] if '@' in user_name else user_name
-                
-                log_entry = {
-                    'user': display_name,
-                    'email': user_email,
-                    'user_id': participant.get('user_id', participant.get('id', 'Unknown')),
-                    'ip': ip_address,
-                    'timestamp': participant.get('join_time', datetime.now(timezone.utc).isoformat()),
-                    'action': 'meeting_participant',
-                    'meeting_topic': meeting_topic,
-                    'meeting_id': meeting_id,
-                    'duration': participant.get('duration', 0),
-                    'location': participant.get('location', 'Unknown')
-                }
-                logs.append(log_entry)
-            
-            # Rate limiting
-            time.sleep(0.3)
+            return self._get_meeting_participants(meeting_id), meeting_id, meeting_topic
         
+        # ponytail: 20 workers, 429 backoff in _get self-throttles if Dashboard API pushes back
+        with ThreadPoolExecutor(max_workers=20) as executor:
+            future_to_meeting = {
+                executor.submit(fetch_participants, meeting): meeting 
+                for meeting in meetings
+            }
+            
+            failed_meetings = 0
+            for idx, future in enumerate(as_completed(future_to_meeting), 1):
+                if idx % 10 == 0 or idx == len(meetings):
+                    print(f"   Processing meeting {idx}/{len(meetings)}...")
+
+                try:
+                    participants, meeting_id, meeting_topic = future.result()
+                    
+                    for participant in participants:
+                        ip_address = participant.get('ip_address')
+                        if not ip_address:
+                            continue
+                        
+                        user_name = participant.get('user_name', participant.get('name', 'Unknown'))
+                        user_email = participant.get('user_email', participant.get('email', ''))
+                        
+                        if not user_email and '@' in user_name:
+                            user_email = user_name
+                        elif not user_email:
+                            user_email = 'Unknown'
+                        
+                        display_name = user_name.split('@')[0] if '@' in user_name else user_name
+                        
+                        log_entry = {
+                            'user': display_name,
+                            'email': user_email,
+                            'user_id': participant.get('user_id', participant.get('id', 'Unknown')),
+                            'ip': ip_address,
+                            'timestamp': participant.get('join_time', datetime.now(timezone.utc).isoformat()),
+                            'action': 'meeting_participant',
+                            'meeting_topic': meeting_topic,
+                            'meeting_id': meeting_id,
+                            'duration': participant.get('duration', 0),
+                            'location': participant.get('location', 'Unknown')
+                        }
+                        logs.append(log_entry)
+                except Exception:
+                    failed_meetings += 1
+
+        if failed_meetings:
+            print(f"   ⚠️  {failed_meetings} meetings skipped (participant fetch failed)")
         print(f"   ✓ Retrieved {len(logs)} Zoom participant entries")
         return logs
     
+    def _get(self, url: str, params: Dict) -> requests.Response:
+        """GET with 429 retry (honors Retry-After, else exponential backoff)."""
+        headers = {'Authorization': f'Bearer {self.access_token}'}
+        for attempt in range(5):
+            response = self.session.get(url, headers=headers, params=params, timeout=30)
+            if response.status_code != 429:
+                return response
+            retry_after = response.headers.get('Retry-After')
+            time.sleep(int(retry_after) if retry_after and retry_after.isdigit() else 2 ** attempt)
+        return response
+
     def _get_past_meetings(self, start_date: datetime, end_date: datetime) -> List[Dict]:
         """Get list of past meetings using Dashboard API."""
         meetings = []
         next_page_token = None
-        
-        headers = {
-            'Authorization': f'Bearer {self.access_token}',
-            'Content-Type': 'application/json'
-        }
-        
+
         while True:
             params = {
                 'type': 'past',  # Important: Must specify 'past' to get completed meetings
                 'from': start_date.strftime('%Y-%m-%d'),
                 'to': end_date.strftime('%Y-%m-%d'),
-                'page_size': 30
+                'page_size': 300  # API max
             }
             
             if next_page_token:
                 params['next_page_token'] = next_page_token
             
             try:
-                response = requests.get(
-                    f"{self.BASE_URL}/metrics/meetings",
-                    headers=headers,
-                    params=params,
-                    timeout=30
-                )
-                
+                response = self._get(f"{self.BASE_URL}/metrics/meetings", params)
+
                 if response.status_code == 403:
                     raise Exception(
                         "Access denied to Dashboard API. This requires:\n"
@@ -181,10 +198,7 @@ class ZoomExtractor:
                 next_page_token = data.get('next_page_token')
                 if not next_page_token:
                     break
-                
-                # Rate limiting
-                time.sleep(0.3)
-                    
+
             except requests.exceptions.RequestException as e:
                 raise Exception(f"Failed to fetch Zoom meetings: {str(e)}")
         
@@ -194,15 +208,10 @@ class ZoomExtractor:
         """Get participants for a specific meeting with IP addresses."""
         participants = []
         next_page_token = None
-        
-        headers = {
-            'Authorization': f'Bearer {self.access_token}',
-            'Content-Type': 'application/json'
-        }
-        
+
         while True:
             params = {
-                'page_size': 30,
+                'page_size': 300,  # API max
                 'include_fields': 'registrant_id',  # This ensures we get all participant details including IPs
                 'type': 'past'
             }
@@ -212,13 +221,11 @@ class ZoomExtractor:
             
             try:
                 # Use numeric meeting ID directly (no encoding needed)
-                response = requests.get(
+                response = self._get(
                     f"{self.BASE_URL}/metrics/meetings/{meeting_id}/participants",
-                    headers=headers,
-                    params=params,
-                    timeout=30
+                    params
                 )
-                
+
                 # Meeting might not have participants or might be too old
                 if response.status_code == 404:
                     break
