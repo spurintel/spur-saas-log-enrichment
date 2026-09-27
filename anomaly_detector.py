@@ -6,41 +6,51 @@ Extracts IP addresses from Slack and Zoom logs and detects anomalies using vario
 
 import argparse
 import json
+import os
 import sys
 from datetime import datetime, timezone
 from typing import Dict, List, Set
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from enrichment.spur_enrichment import SpurEnrichment
 from enrichment.file_enrichment import FileEnrichment
 from extractors.slack_extractor import SlackExtractor
 from extractors.zoom_extractor import ZoomExtractor
+from extractors.teamtailor_extractor import TeamtailorExtractor
+
+TEAMTAILOR_KEY_PREFIX = 'TEAMTAILOR_API_KEY_'
+
+
+def teamtailor_keys() -> Dict[str, str]:
+    """{workspace: api_key} from TEAMTAILOR_API_KEY_<WORKSPACE> env vars, e.g. TEAMTAILOR_API_KEY_DK."""
+    return {k[len(TEAMTAILOR_KEY_PREFIX):].lower(): v
+            for k, v in os.environ.items() if k.startswith(TEAMTAILOR_KEY_PREFIX) and v}
 
 
 class AnomalyDetector:
     """Main class for detecting IP anomalies in SaaS logs."""
 
-    # Critical VPN/Proxy operators to alert on in CLI output
-    # Edit this list to add/remove operators that require immediate attention
-    CRITICAL_OPERATORS = ['ASTRILL_VPN',
-                          'PROXYSOCKS5_PROXY',
-                          'SHADOW_TECH_VDI',
-                          'GLKVM_VDI',
-                          'KASM_VDI',
-                          'DIGIRDP_VDI',
-                          'OPENAI_VDI',
-                          'PAPERSPACE_VDI',
-                          'NANOKVM_VDI',
-                          'PIKVM_VDI',
-                          'BROWSERLING_VDI',
-                          'SHELLS_VDI',
-                          'GENYMOTION_VDI',
-                          'TINYPILOT_VDI',
-                          'JETKVM_VDI',
-                          'SILO_VDI']
-
     def __init__(self):
         self.slack_data = []
         self.zoom_data = []
+        self.teamtailor_data = []
         self.anomalies = []
+
+    def extract_teamtailor_data(self, api_key: str, account: str, days: int = 30) -> List[Dict]:
+        """Extract applicant IPs from Teamtailor. Failures are logged, not raised, so Slack/Zoom still run."""
+        print(f"📥 Extracting Teamtailor ({account}) data for the last {days} days...")
+        try:
+            data = TeamtailorExtractor(api_key, account).extract_ip_logs(days)
+        except Exception as e:
+            print(f"   ⚠️  Teamtailor ({account}) extraction failed: {e}", file=sys.stderr)
+            return []
+        self.teamtailor_data.extend(data)
+        print(f"✅ Extracted {len(data)} Teamtailor ({account}) entries")
+        return data
+
+    def _all_data(self) -> List[Dict]:
+        return ([{**e, 'source': 'slack'} for e in self.slack_data]
+                + [{**e, 'source': 'zoom'} for e in self.zoom_data]
+                + [{**e, 'source': 'teamtailor'} for e in self.teamtailor_data])
 
     def extract_slack_data(self, api_token: str, days: int = 30) -> List[Dict]:
         """Extract IP addresses and user data from Slack."""
@@ -62,28 +72,14 @@ class AnomalyDetector:
         """Enrich IP data using Spur Context API to detect VPNs and tunnels."""
         print(f"\n🔍 Enriching data with Spur API...")
         enricher = SpurEnrichment(api_token, reports_dir)
-
-        all_data = [
-            {**entry, 'source': 'slack'} for entry in self.slack_data
-        ] + [
-            {**entry, 'source': 'zoom'} for entry in self.zoom_data
-        ]
-
-        self.anomalies = enricher.enrich_and_detect(all_data)
+        self.anomalies = enricher.enrich_and_detect(self._all_data())
         return self.anomalies
 
     def enrich_with_file(self, filepath: str) -> List[Dict]:
         """Enrich IP data using a file containing suspicious IP addresses."""
         print(f"🔍 Enriching data with IP list from {filepath}...")
         enricher = FileEnrichment(filepath)
-
-        all_data = [
-            {**entry, 'source': 'slack'} for entry in self.slack_data
-        ] + [
-            {**entry, 'source': 'zoom'} for entry in self.zoom_data
-        ]
-
-        self.anomalies = enricher.enrich_and_detect(all_data)
+        self.anomalies = enricher.enrich_and_detect(self._all_data())
         print(
             f"⚠️  Found {len(self.anomalies)} anomalies (matched suspicious IPs)")
         return self.anomalies
@@ -95,21 +91,20 @@ class AnomalyDetector:
             'summary': {
                 'slack_entries': len(self.slack_data),
                 'zoom_entries': len(self.zoom_data),
+                'teamtailor_entries': len(self.teamtailor_data),
                 'total_anomalies': len(self.anomalies)
             },
             'anomalies': self.anomalies
         }
 
         if output_file:
+            os.makedirs(os.path.dirname(output_file) or '.', exist_ok=True)
             with open(output_file, 'w') as f:
                 json.dump(report, f, indent=2)
             print(f"\n✓ Anomaly report saved to {output_file}")
 
-        # Filter anomalies for critical operators only (for CLI display)
-        critical_anomalies = [
-            a for a in self.anomalies
-            if a.get('vpn_operator') in self.CRITICAL_OPERATORS
-        ]
+        # Every watchlist hit is critical
+        critical_anomalies = list(self.anomalies)
 
         # Count and display critical alerts with deduplication
         displayed_count = 0
@@ -149,7 +144,7 @@ class AnomalyDetector:
         print(f"DETECTION SUMMARY")
         print(f"{'='*60}")
         print(
-            f"Entries analyzed: {report['summary']['slack_entries'] + report['summary']['zoom_entries']}")
+            f"Entries analyzed: {report['summary']['slack_entries'] + report['summary']['zoom_entries'] + report['summary']['teamtailor_entries']}")
         print(
             f"Anonymous VPN detections: {report['summary']['total_anomalies']}")
         print(f"Critical alerts (displayed): {displayed_count}")
@@ -183,9 +178,6 @@ class AnomalyDetector:
         else:
             print("\n✓ No critical VPN/proxy detections")
 
-        if report['summary']['total_anomalies'] > len(critical_anomalies):
-            print(
-                f"Note: {report['summary']['total_anomalies'] - len(critical_anomalies)} other VPN detections saved to report (not critical)")
 
         print(f"{'='*60}\n")
         return report
@@ -210,11 +202,17 @@ Examples:
         """
     )
 
-    # Data extraction arguments
-    parser.add_argument('--slack-token', help='Slack API token')
-    parser.add_argument('--zoom-account-id', help='Zoom Account ID')
-    parser.add_argument('--zoom-client-id', help='Zoom Client ID')
-    parser.add_argument('--zoom-client-secret', help='Zoom Client Secret')
+    # Data extraction arguments (fall back to env vars so secrets stay out of the process list)
+    parser.add_argument('--slack-token', default=os.environ.get('SLACK_API_TOKEN'),
+                        help='Slack API token (env: SLACK_API_TOKEN)')
+    parser.add_argument('--zoom-account-id', default=os.environ.get('ZOOM_ACCOUNT_ID'),
+                        help='Zoom Account ID (env: ZOOM_ACCOUNT_ID)')
+    parser.add_argument('--zoom-client-id', default=os.environ.get('ZOOM_CLIENT_ID'),
+                        help='Zoom Client ID (env: ZOOM_CLIENT_ID)')
+    parser.add_argument('--zoom-client-secret', default=os.environ.get('ZOOM_CLIENT_SECRET'),
+                        help='Zoom Client Secret (env: ZOOM_CLIENT_SECRET)')
+    parser.add_argument('--no-teamtailor', action='store_true',
+                        help='Skip Teamtailor even if TEAMTAILOR_API_KEY_<WORKSPACE> env vars are set')
     parser.add_argument('--days', type=int, default=30,
                         help='Number of days to analyze (default: 30)')
 
@@ -222,7 +220,8 @@ Examples:
     parser.add_argument('--enrichment', choices=['spur', 'file'], required=True,
                         help='Enrichment method: spur (API) or file (IP list)')
     parser.add_argument(
-        '--spur-token', help='Spur Context API token (required for spur enrichment)')
+        '--spur-token', default=os.environ.get('SPUR_API_TOKEN'),
+        help='Spur Context API token (required for spur enrichment, env: SPUR_API_TOKEN)')
     parser.add_argument(
         '--ip-file', help='Path to file with suspicious IPs (required for file enrichment)')
 
@@ -235,9 +234,10 @@ Examples:
     args = parser.parse_args()
 
     # Validate arguments
-    if not args.slack_token and not args.zoom_account_id:
+    tt_keys = {} if args.no_teamtailor else teamtailor_keys()
+    if not (args.slack_token or args.zoom_account_id or tt_keys):
         parser.error(
-            "At least one data source (--slack-token or --zoom-account-id) must be provided")
+            "At least one data source (--slack-token, --zoom-account-id or TEAMTAILOR_API_KEY_<WORKSPACE>) must be provided")
 
     if args.zoom_account_id and not (args.zoom_client_id and args.zoom_client_secret):
         parser.error(
@@ -252,32 +252,57 @@ Examples:
     # Run detection
     detector = AnomalyDetector()
 
+    # Default report filename if not specified
+    output_file = args.output
+    if not output_file:
+        timestamp = datetime.now(timezone.utc).strftime('%Y%m%d')
+        output_file = f"{args.reports_dir}/anomaly_report_{timestamp}.json"
+
     try:
-        # Extract data
-        if args.slack_token:
-            detector.extract_slack_data(args.slack_token, args.days)
+        # Extract data in parallel
+        with ThreadPoolExecutor() as executor:
+            futures = []
 
-        if args.zoom_account_id:
-            detector.extract_zoom_data(
-                args.zoom_account_id,
-                args.zoom_client_id,
-                args.zoom_client_secret,
-                args.days
-            )
+            if args.slack_token:
+                futures.append(
+                    executor.submit(
+                        detector.extract_slack_data,
+                        args.slack_token,
+                        args.days
+                    )
+                )
 
-        # Enrich data
+            if args.zoom_account_id:
+                futures.append(
+                    executor.submit(
+                        detector.extract_zoom_data,
+                        args.zoom_account_id,
+                        args.zoom_client_id,
+                        args.zoom_client_secret,
+                        args.days
+                    )
+                )
+
+            for account, key in tt_keys.items():
+                futures.append(executor.submit(
+                    detector.extract_teamtailor_data, key, account, args.days))
+
+            # File enrichment is a cheap local lookup, so write an interim
+            # report as each source finishes instead of waiting for both.
+            done = 0
+            for future in as_completed(futures):
+                future.result()
+                done += 1
+                if args.enrichment == 'file':
+                    if done < len(futures):
+                        print(f"\n📝 Writing interim report ({done}/{len(futures)} sources done)...")
+                    detector.enrich_with_file(args.ip_file)
+                    detector.generate_report(output_file)
+
+        # Spur enrichment costs API calls per IP — run it once, after all sources
         if args.enrichment == 'spur':
             detector.enrich_with_spur(args.spur_token, args.reports_dir)
-        elif args.enrichment == 'file':
-            detector.enrich_with_file(args.ip_file)
-
-        # Generate report with default filename if not specified
-        output_file = args.output
-        if not output_file:
-            timestamp = datetime.now(timezone.utc).strftime('%Y%m%d')
-            output_file = f"{args.reports_dir}/anomaly_report_{timestamp}.json"
-
-        detector.generate_report(output_file)
+            detector.generate_report(output_file)
 
     except Exception as e:
         print(f"❌ Error: {str(e)}", file=sys.stderr)
