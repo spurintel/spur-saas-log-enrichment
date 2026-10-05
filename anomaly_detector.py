@@ -6,41 +6,108 @@ Extracts IP addresses from Slack and Zoom logs and detects anomalies using vario
 
 import argparse
 import json
+import os
 import sys
 from datetime import datetime, timezone
 from typing import Dict, List, Set
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from enrichment.spur_enrichment import SpurEnrichment
 from enrichment.file_enrichment import FileEnrichment
 from extractors.slack_extractor import SlackExtractor
 from extractors.zoom_extractor import ZoomExtractor
+from extractors.teamtailor_extractor import TeamtailorExtractor
+from extractors.okta_extractor import OktaExtractor
+
+TEAMTAILOR_KEY_PREFIX = 'TEAMTAILOR_API_KEY_'
+OKTA_PROXY_TAG = 'OKTA_FLAGGED_PROXY'
+# AS orgs whose isProxy verdict is not worth alerting on, matched as lowercase substrings.
+# iCloud Private Relay egresses through Akamai, Cloudflare and Fastly: on this org they were
+# 310 of the 316 isProxy addresses staff used in 90 days, every one a legitimate Apple user.
+# Without this the flag is unusable. Override with OKTA_PROXY_IGNORE_ASORG (comma separated);
+# a sanctioned corporate VPN gateway belongs here too.
+DEFAULT_PROXY_IGNORE_ASORG = ('akamai', 'cloudflare', 'fastly')
+REPO = os.path.dirname(os.path.abspath(__file__))
+
+
+def load_env():
+    """Load KEY=VALUE lines from .env (an `export ` prefix is tolerated); real environment variables win."""
+    path = os.path.join(REPO, '.env')
+    if not os.path.exists(path):
+        return
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith('export '):
+                line = line[len('export '):].lstrip()
+            if line and not line.startswith('#') and '=' in line:
+                key, value = line.split('=', 1)
+                os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+def teamtailor_keys() -> Dict[str, str]:
+    """{workspace: api_key} from TEAMTAILOR_API_KEY_<WORKSPACE> env vars, e.g. TEAMTAILOR_API_KEY_DK."""
+    return {k[len(TEAMTAILOR_KEY_PREFIX):].lower(): v
+            for k, v in os.environ.items() if k.startswith(TEAMTAILOR_KEY_PREFIX) and v}
+
+
+def okta_proxy_ignored() -> List[str]:
+    """AS-org substrings whose isProxy verdict is ignored, from OKTA_PROXY_IGNORE_ASORG."""
+    raw = (os.environ.get('OKTA_PROXY_IGNORE_ASORG') or '').strip()
+    if not raw:
+        return list(DEFAULT_PROXY_IGNORE_ASORG)
+    return [t.strip().lower() for t in raw.split(',') if t.strip()]
+
+
+def okta_event_types() -> List[str]:
+    """Event types to pull, from OKTA_EVENT_TYPES (comma separated). Unset, or '*', means
+    every type: the filter is an optimisation, not a safety net, so it is opt-in."""
+    raw = (os.environ.get('OKTA_EVENT_TYPES') or '').strip()
+    if not raw or raw == '*':
+        return []
+    return [t.strip() for t in raw.split(',') if t.strip()]
 
 
 class AnomalyDetector:
     """Main class for detecting IP anomalies in SaaS logs."""
 
-    # Critical VPN/Proxy operators to alert on in CLI output
-    # Edit this list to add/remove operators that require immediate attention
-    CRITICAL_OPERATORS = ['ASTRILL_VPN',
-                          'PROXYSOCKS5_PROXY',
-                          'SHADOW_TECH_VDI',
-                          'GLKVM_VDI',
-                          'KASM_VDI',
-                          'DIGIRDP_VDI',
-                          'OPENAI_VDI',
-                          'PAPERSPACE_VDI',
-                          'NANOKVM_VDI',
-                          'PIKVM_VDI',
-                          'BROWSERLING_VDI',
-                          'SHELLS_VDI',
-                          'GENYMOTION_VDI',
-                          'TINYPILOT_VDI',
-                          'JETKVM_VDI',
-                          'SILO_VDI']
-
     def __init__(self):
         self.slack_data = []
         self.zoom_data = []
+        self.teamtailor_data = []
+        self.okta_data = []
         self.anomalies = []
+        self._file_enricher = None
+
+    def extract_teamtailor_data(self, api_key: str, account: str, days: int = 30) -> List[Dict]:
+        """Extract applicant IPs from Teamtailor. Failures are logged, not raised, so Slack/Zoom still run."""
+        print(f"📥 Extracting Teamtailor ({account}) data for the last {days} days...")
+        try:
+            data = TeamtailorExtractor(api_key, account).extract_ip_logs(days)
+        except Exception as e:
+            print(f"   ⚠️  Teamtailor ({account}) extraction failed: {e}", file=sys.stderr)
+            return []
+        self.teamtailor_data.extend(data)
+        print(f"✅ Extracted {len(data)} Teamtailor ({account}) entries")
+        return data
+
+    def extract_okta_data(self, org_url: str, api_token: str, days: int = 30) -> List[Dict]:
+        """Extract user IPs from the Okta System Log. Failures are logged, not raised, so the
+        other sources still run (the cron wrapper turns the logged failure into a non-zero exit)."""
+        print(f"\U0001f4e5 Extracting Okta data for the last {days} days...")
+        try:
+            data = OktaExtractor(org_url, api_token, okta_event_types()).extract_ip_logs(days)
+        except Exception as e:
+            print(f"   \u26a0\ufe0f  Okta extraction failed: {e}", file=sys.stderr)
+            return []
+        self.okta_data = data
+        print(f"\u2705 Extracted {len(data)} Okta entries")
+        return data
+
+    def _all_data(self) -> List[Dict]:
+        return ([{**e, 'source': 'slack'} for e in self.slack_data]
+                + [{**e, 'source': 'zoom'} for e in self.zoom_data]
+                + [{**e, 'source': 'teamtailor'} for e in self.teamtailor_data]
+                + [{**e, 'source': 'okta'} for e in self.okta_data])
 
     def extract_slack_data(self, api_token: str, days: int = 30) -> List[Dict]:
         """Extract IP addresses and user data from Slack."""
@@ -62,31 +129,56 @@ class AnomalyDetector:
         """Enrich IP data using Spur Context API to detect VPNs and tunnels."""
         print(f"\n🔍 Enriching data with Spur API...")
         enricher = SpurEnrichment(api_token, reports_dir)
-
-        all_data = [
-            {**entry, 'source': 'slack'} for entry in self.slack_data
-        ] + [
-            {**entry, 'source': 'zoom'} for entry in self.zoom_data
-        ]
-
-        self.anomalies = enricher.enrich_and_detect(all_data)
+        self.anomalies = enricher.enrich_and_detect(self._all_data())
         return self.anomalies
 
     def enrich_with_file(self, filepath: str) -> List[Dict]:
         """Enrich IP data using a file containing suspicious IP addresses."""
         print(f"🔍 Enriching data with IP list from {filepath}...")
-        enricher = FileEnrichment(filepath)
-
-        all_data = [
-            {**entry, 'source': 'slack'} for entry in self.slack_data
-        ] + [
-            {**entry, 'source': 'zoom'} for entry in self.zoom_data
-        ]
-
-        self.anomalies = enricher.enrich_and_detect(all_data)
+        # Built once and reused: file enrichment reruns after every source finishes, and
+        # reparsing a 60k-row watchlist ~40 times costs more CPU than the extraction does.
+        # Reusing it also keeps the per-address lookup cache warm across sources.
+        if self._file_enricher is None or self._file_enricher.filepath != filepath:
+            self._file_enricher = FileEnrichment(filepath)
+        enricher = self._file_enricher
+        entries = self._all_data()
+        self.anomalies = enricher.enrich_and_detect(entries)
         print(
             f"⚠️  Found {len(self.anomalies)} anomalies (matched suspicious IPs)")
+        self.anomalies += self._okta_proxy_anomalies(entries, enricher)
         return self.anomalies
+
+    @staticmethod
+    def _okta_proxy_anomalies(entries: List[Dict], enricher) -> List[Dict]:
+        """Okta's own isProxy verdict, as findings. Opt in with OKTA_ALERT_ON_PROXY=1.
+
+        Off by default because enabling it on an org that routes a business unit through a
+        shared VPN gateway produces a burst. It is worth having: on this org the address
+        watchlist matched a single (user, IP) pair in 24,784 while isProxy marked 270, so
+        the vendor sees anonymising infrastructure that a list of literal addresses cannot.
+        Entries already flagged by the watchlist are left alone rather than duplicated."""
+        if (os.environ.get('OKTA_ALERT_ON_PROXY') or '').strip().lower() not in ('1', 'true', 'yes'):
+            return []
+        ignored = okta_proxy_ignored()
+        found = []
+        for entry in entries:
+            if entry.get('source') != 'okta' or not entry.get('is_proxy'):
+                continue
+            as_org = (entry.get('as_org') or '').lower()
+            if any(skip in as_org for skip in ignored):
+                continue  # consumer relay or a sanctioned gateway, not a finding
+            if entry.get('ip') and enricher.lookup(entry['ip']):
+                continue  # already reported as a watchlist hit
+            found.append({
+                **entry,
+                'vpn_operator': entry.get('as_org') or OKTA_PROXY_TAG,
+                'enrichment': {'ip': entry.get('ip'), 'matched': True,
+                               'source': 'okta_is_proxy', 'operator': OKTA_PROXY_TAG},
+                'anomaly_type': 'Anonymising infrastructure (Okta isProxy)',
+                'risk_score': 60,  # a vendor heuristic, not a curated watchlist hit
+            })
+        print(f"⚠️  Found {len(found)} Okta isProxy anomalies")
+        return found
 
     def generate_report(self, output_file: str = None):
         """Generate a detailed report of findings."""
@@ -95,21 +187,21 @@ class AnomalyDetector:
             'summary': {
                 'slack_entries': len(self.slack_data),
                 'zoom_entries': len(self.zoom_data),
+                'teamtailor_entries': len(self.teamtailor_data),
+                'okta_entries': len(self.okta_data),
                 'total_anomalies': len(self.anomalies)
             },
             'anomalies': self.anomalies
         }
 
         if output_file:
+            os.makedirs(os.path.dirname(output_file) or '.', exist_ok=True)
             with open(output_file, 'w') as f:
                 json.dump(report, f, indent=2)
             print(f"\n✓ Anomaly report saved to {output_file}")
 
-        # Filter anomalies for critical operators only (for CLI display)
-        critical_anomalies = [
-            a for a in self.anomalies
-            if a.get('vpn_operator') in self.CRITICAL_OPERATORS
-        ]
+        # Every watchlist hit is critical
+        critical_anomalies = list(self.anomalies)
 
         # Count and display critical alerts with deduplication
         displayed_count = 0
@@ -149,7 +241,7 @@ class AnomalyDetector:
         print(f"DETECTION SUMMARY")
         print(f"{'='*60}")
         print(
-            f"Entries analyzed: {report['summary']['slack_entries'] + report['summary']['zoom_entries']}")
+            f"Entries analyzed: {report['summary']['slack_entries'] + report['summary']['zoom_entries'] + report['summary']['teamtailor_entries'] + report['summary']['okta_entries']}")
         print(
             f"Anonymous VPN detections: {report['summary']['total_anomalies']}")
         print(f"Critical alerts (displayed): {displayed_count}")
@@ -183,17 +275,18 @@ class AnomalyDetector:
         else:
             print("\n✓ No critical VPN/proxy detections")
 
-        if report['summary']['total_anomalies'] > len(critical_anomalies):
-            print(
-                f"Note: {report['summary']['total_anomalies'] - len(critical_anomalies)} other VPN detections saved to report (not critical)")
 
         print(f"{'='*60}\n")
         return report
 
 
 def main():
+    # Before the parser: every credential argument defaults from os.environ, so the .env
+    # values have to be in place by the time add_argument runs. Without this the detector
+    # only worked as a subprocess of slack_alert_cron.py, which loaded .env on its behalf.
+    load_env()
     parser = argparse.ArgumentParser(
-        description='Detect IP anomalies in Slack and Zoom logs',
+        description='Detect IP anomalies in Slack, Zoom, Teamtailor and Okta logs',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -210,19 +303,35 @@ Examples:
         """
     )
 
-    # Data extraction arguments
-    parser.add_argument('--slack-token', help='Slack API token')
-    parser.add_argument('--zoom-account-id', help='Zoom Account ID')
-    parser.add_argument('--zoom-client-id', help='Zoom Client ID')
-    parser.add_argument('--zoom-client-secret', help='Zoom Client Secret')
+    # Data extraction arguments (fall back to env vars so secrets stay out of the process list)
+    parser.add_argument('--slack-token', default=os.environ.get('SLACK_API_TOKEN'),
+                        help='Slack API token (env: SLACK_API_TOKEN)')
+    parser.add_argument('--zoom-account-id', default=os.environ.get('ZOOM_ACCOUNT_ID'),
+                        help='Zoom Account ID (env: ZOOM_ACCOUNT_ID)')
+    parser.add_argument('--zoom-client-id', default=os.environ.get('ZOOM_CLIENT_ID'),
+                        help='Zoom Client ID (env: ZOOM_CLIENT_ID)')
+    parser.add_argument('--zoom-client-secret', default=os.environ.get('ZOOM_CLIENT_SECRET'),
+                        help='Zoom Client Secret (env: ZOOM_CLIENT_SECRET)')
+    parser.add_argument('--no-teamtailor', action='store_true',
+                        help='Skip Teamtailor even if TEAMTAILOR_API_KEY_<WORKSPACE> env vars are set')
+    parser.add_argument('--okta-org-url', default=os.environ.get('OKTA_ORG_URL'),
+                        help='Okta org or custom domain, e.g. https://auth.example.com (env: OKTA_ORG_URL)')
+    parser.add_argument('--okta-token', default=os.environ.get('OKTA_API_TOKEN'),
+                        help='Okta API token, used as SSWS (env: OKTA_API_TOKEN)')
+    parser.add_argument('--no-okta', action='store_true',
+                        help='Skip Okta even if OKTA_ORG_URL and OKTA_API_TOKEN are set')
     parser.add_argument('--days', type=int, default=30,
                         help='Number of days to analyze (default: 30)')
+    parser.add_argument('--hours', type=float,
+                        help='Window in hours, overriding --days; fractions allowed. The cron '
+                             'wrapper passes the gap back to its last clean run.')
 
     # Enrichment arguments
     parser.add_argument('--enrichment', choices=['spur', 'file'], required=True,
                         help='Enrichment method: spur (API) or file (IP list)')
     parser.add_argument(
-        '--spur-token', help='Spur Context API token (required for spur enrichment)')
+        '--spur-token', default=os.environ.get('SPUR_API_TOKEN'),
+        help='Spur Context API token (required for spur enrichment, env: SPUR_API_TOKEN)')
     parser.add_argument(
         '--ip-file', help='Path to file with suspicious IPs (required for file enrichment)')
 
@@ -233,11 +342,21 @@ Examples:
                         help='Directory for reports (default: reports)')
 
     args = parser.parse_args()
+    if args.hours is not None and args.hours <= 0:
+        parser.error("--hours must be positive")
+    # Extractors take a day count; a float is fine, they all build a timedelta from it.
+    days = args.hours / 24 if args.hours is not None else args.days
 
     # Validate arguments
-    if not args.slack_token and not args.zoom_account_id:
+    tt_keys = {} if args.no_teamtailor else teamtailor_keys()
+    use_okta = bool(args.okta_org_url and args.okta_token) and not args.no_okta
+    if not (args.slack_token or args.zoom_account_id or tt_keys or use_okta):
         parser.error(
-            "At least one data source (--slack-token or --zoom-account-id) must be provided")
+            "At least one data source (--slack-token, --zoom-account-id, --okta-org-url with "
+            "--okta-token, or TEAMTAILOR_API_KEY_<WORKSPACE>) must be provided")
+
+    if bool(args.okta_org_url) != bool(args.okta_token) and not args.no_okta:
+        parser.error("--okta-org-url and --okta-token must be given together")
 
     if args.zoom_account_id and not (args.zoom_client_id and args.zoom_client_secret):
         parser.error(
@@ -252,32 +371,61 @@ Examples:
     # Run detection
     detector = AnomalyDetector()
 
+    # Default report filename if not specified
+    output_file = args.output
+    if not output_file:
+        timestamp = datetime.now(timezone.utc).strftime('%Y%m%d')
+        output_file = f"{args.reports_dir}/anomaly_report_{timestamp}.json"
+
     try:
-        # Extract data
-        if args.slack_token:
-            detector.extract_slack_data(args.slack_token, args.days)
+        # Extract data in parallel
+        with ThreadPoolExecutor() as executor:
+            futures = []
 
-        if args.zoom_account_id:
-            detector.extract_zoom_data(
-                args.zoom_account_id,
-                args.zoom_client_id,
-                args.zoom_client_secret,
-                args.days
-            )
+            if args.slack_token:
+                futures.append(
+                    executor.submit(
+                        detector.extract_slack_data,
+                        args.slack_token,
+                        days
+                    )
+                )
 
-        # Enrich data
+            if args.zoom_account_id:
+                futures.append(
+                    executor.submit(
+                        detector.extract_zoom_data,
+                        args.zoom_account_id,
+                        args.zoom_client_id,
+                        args.zoom_client_secret,
+                        days
+                    )
+                )
+
+            for account, key in tt_keys.items():
+                futures.append(executor.submit(
+                    detector.extract_teamtailor_data, key, account, days))
+
+            if use_okta:
+                futures.append(executor.submit(
+                    detector.extract_okta_data, args.okta_org_url, args.okta_token, days))
+
+            # File enrichment is a cheap local lookup, so write an interim
+            # report as each source finishes instead of waiting for both.
+            done = 0
+            for future in as_completed(futures):
+                future.result()
+                done += 1
+                if args.enrichment == 'file':
+                    if done < len(futures):
+                        print(f"\n📝 Writing interim report ({done}/{len(futures)} sources done)...")
+                    detector.enrich_with_file(args.ip_file)
+                    detector.generate_report(output_file)
+
+        # Spur enrichment costs API calls per IP — run it once, after all sources
         if args.enrichment == 'spur':
             detector.enrich_with_spur(args.spur_token, args.reports_dir)
-        elif args.enrichment == 'file':
-            detector.enrich_with_file(args.ip_file)
-
-        # Generate report with default filename if not specified
-        output_file = args.output
-        if not output_file:
-            timestamp = datetime.now(timezone.utc).strftime('%Y%m%d')
-            output_file = f"{args.reports_dir}/anomaly_report_{timestamp}.json"
-
-        detector.generate_report(output_file)
+            detector.generate_report(output_file)
 
     except Exception as e:
         print(f"❌ Error: {str(e)}", file=sys.stderr)

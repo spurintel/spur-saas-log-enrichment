@@ -63,3 +63,13 @@ iocs.txt
 !examples/*.json
 !examples/*.txt
 
+anomaly_cron.log
+
+# Local secrets, backups and intel data
+.env*
+*.bak*
+data.csv
+
+# slack_alert_cron run lock and atomic-write temp files
+.slack_alert_cron.lock
+*.json.tmp

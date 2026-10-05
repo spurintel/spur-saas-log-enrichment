@@ -10,9 +10,7 @@ class SlackExtractor:
     """Extract IP addresses and user information from Slack access logs."""
     
     BASE_URL = "https://slack.com/api"
-    MAX_REQUESTS_PER_MINUTE = 20
-    RATE_LIMIT_WINDOW = 60  # seconds
-    
+
     def __init__(self, api_token: str):
         """
         Initialize Slack extractor.
@@ -27,34 +25,30 @@ class SlackExtractor:
             'Content-Type': 'application/json'
         }
         self.user_cache = {}
-    
-    def _make_request_with_backoff(self, url: str, params: Dict = None, timeout: int = 30, max_retries: int = 5, enforce_rate_limit: bool = False) -> requests.Response:
+        self.session = requests.Session()  # connection reuse across paginated requests
+
+    def _make_request_with_backoff(self, url: str, params: Dict = None, timeout: int = 30, max_retries: int = 5) -> requests.Response:
         """
         Make a request with exponential backoff for 429 errors.
-        
+
         Args:
             url: The URL to request
             params: Request parameters
             timeout: Request timeout in seconds
             max_retries: Maximum number of retry attempts
-            enforce_rate_limit: If True, adds a delay to respect rate limits (for pagination)
-            
+
         Returns:
             Response object
-            
+
         Raises:
             Exception: If request fails after all retries
         """
         retry_count = 0
         base_delay = 1  # Start with 1 second delay
-        
+
         while retry_count <= max_retries:
-            # Add a small delay for rate limiting if requested (only for pagination requests)
-            if enforce_rate_limit and retry_count == 0:
-                time.sleep(self.RATE_LIMIT_WINDOW / self.MAX_REQUESTS_PER_MINUTE)
-            
             try:
-                response = requests.get(
+                response = self.session.get(
                     url,
                     headers=self.headers,
                     params=params,
@@ -95,6 +89,40 @@ class SlackExtractor:
         
         raise Exception(f"Request failed after {max_retries} retries")
     
+    def _load_all_users(self):
+        """Prefetch all workspace users into the cache with users.list (paginated)."""
+        cursor = None
+        while True:
+            params = {'limit': 1000}
+            if cursor:
+                params['cursor'] = cursor
+            try:
+                response = self._make_request_with_backoff(
+                    f"{self.BASE_URL}/users.list",
+                    params=params,
+                    timeout=30
+                )
+                data = response.json()
+            except Exception:
+                # Fall back to per-user users.info lookups
+                return
+
+            if not data.get('ok'):
+                return
+
+            for user in data.get('members', []):
+                user_id = user.get('id')
+                if user_id:
+                    self.user_cache[user_id] = {
+                        'name': user.get('name', 'Unknown'),
+                        'real_name': user.get('real_name', 'Unknown'),
+                        'email': user.get('profile', {}).get('email', 'Unknown')
+                    }
+
+            cursor = data.get('response_metadata', {}).get('next_cursor')
+            if not cursor:
+                break
+
     def _get_user_info(self, user_id: str) -> Dict:
         """Get user information from cache or API."""
         if user_id in self.user_cache:
@@ -133,7 +161,10 @@ class SlackExtractor:
             List of dicts with user, email, ip, timestamp, and action
         """
         logs = []
-        
+
+        # Bulk-load all users up front (1-2 requests) instead of one users.info call per user
+        self._load_all_users()
+
         # Note: team.accessLogs only provides last 7 days for Standard/Plus
         # Enterprise Grid can go back further
         if days > 7:
@@ -159,8 +190,7 @@ class SlackExtractor:
                 response = self._make_request_with_backoff(
                     f"{self.BASE_URL}/team.accessLogs",
                     params=params,
-                    timeout=30,
-                    enforce_rate_limit=(page > 1)  # Rate limit after first page
+                    timeout=30
                 )
                 data = response.json()
                 
@@ -216,7 +246,7 @@ class SlackExtractor:
                         'email': user_info['email'],
                         'user_id': user_id,
                         'ip': ip_address,
-                        'timestamp': datetime.fromtimestamp(date_first).isoformat(),
+                        'timestamp': datetime.fromtimestamp(date_first, tz=timezone.utc).isoformat(),
                         'action': 'user_login',
                         'user_agent': login.get('user_agent', 'Unknown'),
                         'count': login.get('count', 1)  # Number of times this IP was used

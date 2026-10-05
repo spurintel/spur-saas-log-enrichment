@@ -1,11 +1,12 @@
 # SaaS IP Anomaly Detector
 
-Detect anonymous VPN tunnels and suspicious IP addresses in your Slack and Zoom logs. Perfect for security teams conducting audits, compliance checks, or investigating potential account compromises.
+Detect anonymous VPN tunnels and suspicious IP addresses in your Slack, Zoom, Teamtailor and Okta logs. Perfect for security teams conducting audits, compliance checks, or investigating potential account compromises.
 
 ## Features
 
 - **Slack Integration** - Extract IP logs from workspace access logs
 - **Zoom Integration** - Pull participant IP addresses from meetings
+- **Okta Integration** - Pull sign-in IPs from the Okta System Log
 - **Spur API** - Detect anonymous VPN tunnels/proxies
 - **Filtered Alerts** - Only display critical VPN/proxy operators on command line
 - **Full Reports** - Complete enrichment data saved to JSON reports
@@ -16,6 +17,7 @@ Detect anonymous VPN tunnels and suspicious IP addresses in your Slack and Zoom 
 - Python 3.7+
 - **Slack**: Paid plan (Standard/Plus/Enterprise Grid) with admin access
 - **Zoom**: Business or Business+ plan (Pro does NOT work)
+- **Okta**: API token with read access to the System Log (optional)
 - **Spur API**: Token from https://spur.us/ (optional)
 
 ## Quick Start
@@ -91,32 +93,140 @@ python anomaly_detector.py \
 
 ## Configuration
 
-### Critical VPN/Proxy Operators
+### Watchlist hits
 
-By default, only these operators trigger command-line alerts:
-- **ASTRILL_VPN**
-- **PROXYSOCKS5_PROXY**
+Every VPN/proxy match in the report is shown in the CLI summary and counted as critical; the
+watchlist (Spur's operator classification, or your `--ip-file`) is the place to curate what
+counts. Operator names come from `tunnels.operator` in `reports/enrichment_report_YYYYMMDD.json`.
 
-All detections are saved to reports, but only critical operators appear in CLI output. This minimizes PII exposure during webinars or live demos.
+The `ip` column takes a single address or a CIDR range, and the most specific entry wins, so
+a `/32` carve-out beats the `/16` it sits inside:
 
-**To customize**, edit `anomaly_detector.py`:
-
-```python
-class AnomalyDetector:
-    CRITICAL_OPERATORS = [
-        'ASTRILL_VPN',
-        'PROXYSOCKS5_PROXY',
-        'NORDVPN',           # Add more
-        'MULLVAD_VPN',       # as needed
-    ]
+```csv
+ip,operator
+198.51.100.7,ASTRILL_VPN
+192.0.2.0/24,SOME_HOSTING_RANGE
+2001:db8::/32,SOME_V6_RANGE
 ```
 
-**Common operator names**:
-- VPNs: `NORDVPN`, `EXPRESSVPN`, `MULLVAD_VPN`, `PROTONVPN`, `SURFSHARK`
-- Privacy: `TOR_EXIT_NODE`, `SHADOWSOCKS`, `LANTERN`
-- Proxies: `LUMINATI`, `SMARTPROXY`, `OXYLABS`, `BRIGHTDATA`
+Ranges matter more than they look: on a 4,000-user org an exact-address watchlist matched one
+`(user, IP)` pair in 24,784 while Okta's own `isProxy` flag marked 270. A malformed row is
+skipped and counted rather than taking the whole watchlist down.
 
-Find operator names in your reports at `reports/enrichment_report_YYYYMMDD.json` under the `tunnels.operator` field.
+### Teamtailor (applicant IPs)
+
+The Teamtailor extractor reads the audit log (`/v1/audit-events`) and yields one entry per
+(candidate, IP) for applicant actions. One API key per workspace, named by workspace:
+
+```bash
+echo "TEAMTAILOR_API_KEY_GLOBAL=..." >> .env   # workspace "global"
+echo "TEAMTAILOR_API_KEY_DK=..." >> .env       # workspace "dk"
+```
+
+Every `TEAMTAILOR_API_KEY_<WORKSPACE>` variable is picked up automatically; `--no-teamtailor`
+skips the source. The key needs read access to audit events and candidates (admin API key).
+
+### Okta (sign-in IPs)
+
+The Okta extractor reads the System Log (`/api/v1/logs`) and yields one entry per (user, IP).
+Set the org — a custom domain works as well as the `*.okta.com` one — and an API token, which
+is sent as `SSWS`:
+
+```bash
+echo "OKTA_ORG_URL=https://auth.example.com" >> .env
+echo "OKTA_API_TOKEN=..." >> .env
+```
+
+Every event type in the window is pulled. Filtering server side saved only about 6s of a
+32s pull on a 2000-user org while risking a blind spot — a sign-on denied by a network zone
+surfaces as `policy.evaluate_sign_on` with a DENY outcome, not as a login event — so the
+filter is opt-in. Narrow it with `OKTA_EVENT_TYPES` (comma separated) only if volume demands
+it; `*` or unset means everything:
+
+```bash
+echo "OKTA_EVENT_TYPES=user.session.start,user.account.lock" >> .env
+```
+
+Each row keeps its `eventType` and `outcome`, so failed and denied attempts are
+distinguishable downstream; the Slack alert marks a non-success outcome as *auth failed*.
+
+Each row keeps Okta's own `securityContext.isProxy` verdict along with the country and AS
+org, and the alert prints them, because "Astrill from China" is a different conversation
+from the same operator at a known office range. Set `OKTA_ALERT_ON_PROXY=1` to alert on
+`isProxy` directly rather than only on watchlist hits — off by default.
+
+Before enabling it, note that the raw flag is mostly iCloud Private Relay: measured over 90
+days on a 4,000-user org, 310 of the 316 `isProxy` addresses staff used were Akamai,
+Cloudflare or Fastly, Apple's three relay egress partners. Those AS orgs are therefore
+excluded by default, which turned 267 findings into 5 over the same period. Override the list
+with `OKTA_PROXY_IGNORE_ASORG` (comma separated, matched as lowercase substrings) — a
+sanctioned corporate VPN gateway belongs in it too:
+
+```bash
+echo "OKTA_PROXY_IGNORE_ASORG=akamai,cloudflare,fastly,proton ag" >> .env
+```
+
+Harvesting `isProxy` addresses into `data.csv` is the wrong move for the same reason: they are
+addresses your own staff use, so they belong in a per-finding signal, not a blocklist.
+
+isProxy findings are a lower-signal stream than a watchlist hit, so they post to their own
+channel via `SLACK_WEBHOOK_URL_PROXY` rather than diluting the main one. If that variable is
+unset while the flag is on, they are **held** — logged as a failure and left out of the state
+file so they post on the next run once the webhook exists — rather than falling back to the
+main channel.
+
+Only `actor.type == "User"` rows are kept, so API-token and application actors do not appear
+as findings. `--no-okta` skips the source. Okta identities are internal, so the cron's
+`WHITELIST` applies to them as it does to Slack and Zoom.
+
+### Slack alert cron (`slack_alert_cron.py`)
+
+Runs the detector and posts only *new* findings to a Slack incoming webhook; alerted
+`(user, IP, operator, source)` keys are kept in `.slack_alert_state.json`, so any cadence up
+to 24h works and a finding alerts once. A lock file stops overlapping runs.
+
+Each run scans back to `.slack_alert_watermark.json` — the start time of the last run that
+finished with no failures — less a 15 minute overlap, capped at 24h. On a 30 minute cadence
+that is a 45 minute window instead of a full day, which matters because Slack's access log is
+rate limited and the page count, not the data, is what makes a run slow: 29 pages become 2.
+A run with any failure leaves the watermark alone, so the next run re-covers its window, and
+a long outage widens the window automatically until it reaches the ceiling. Delete the file
+to force a full 24h scan.
+
+Zoom is the exception: its Dashboard API takes `from`/`to` as whole dates, so a sub-day
+window still lists the whole day's meetings.
+
+```bash
+*/30 * * * * cd /path/to/repo && venv/bin/python slack_alert_cron.py >> anomaly_cron.log 2>&1
+./slack_alert_cron.py --dry-run                    # preview: no Slack post, no notes, no state writes
+./slack_alert_cron.py reports/some_report.json     # replay a report instead of extracting
+./note_report.py reports/some_report.json          # retry the profile notes of a posted report
+```
+
+Credentials are read from `.env` next to the script (real environment variables win):
+
+| Variable | Purpose |
+|---|---|
+| `SLACK_WEBHOOK_URL` | Incoming webhook the alerts are posted to (required) |
+| `TEAMTAILOR_API_KEY_<WORKSPACE>` | One key per workspace, as for the detector |
+| `TEAMTAILOR_NOTE_USER_ID` | Author of profile notes (a user id in the workspace) |
+| `TEAMTAILOR_NOTE_USER_EMAIL` | Or: look the author up by email in each workspace |
+| `TEAMTAILOR_NOTE_USER_ID_<WORKSPACE>` | Per-workspace author override |
+| `OKTA_ORG_URL` / `OKTA_API_TOKEN` | Okta System Log source (both, or neither) |
+| `OKTA_EVENT_TYPES` | Narrow the pull to these event types (default: all) |
+| `OKTA_ALERT_ON_PROXY` | `1` alerts on Okta's isProxy verdict as well as watchlist hits |
+| `OKTA_PROXY_IGNORE_ASORG` | AS orgs whose isProxy verdict is ignored (default: the relay CDNs) |
+| `SLACK_WEBHOOK_URL_PROXY` | Separate webhook for isProxy findings; unset holds them |
+
+Teamtailor user ids are per workspace. The author is resolved in that order; when nothing
+matches in a workspace, the note is posted as the recruiter (job owner) of the candidate's
+application; such a note ends with an "automated message from team.blue Security" footer so
+recruiters do not read it as their colleague's own words. Teamtailor findings get a security note on the profile once per candidate
+(`.teamtailor_noted.json`); applications sent via an AI job tool get an info note only
+(`.teamtailor_ai_noted.json`), no Slack alert; a bare-IP referrer is alerted as a finding.
+A note whose text is already on the profile is never posted twice.
+
+`user_logins.py [USER_ID] [DAYS]` prints one Slack user's recent logins with watchlist hits.
 
 ## Output
 
@@ -155,6 +265,9 @@ All data is saved to `reports/`:
 
 ## Command Line Options
 
+Credentials are read from `.env` next to the script, so the detector runs standalone with no
+environment setup.
+
 ```bash
 # Data Sources
 --slack-token TOKEN          Slack API token (required for Slack)
@@ -162,6 +275,10 @@ All data is saved to `reports/`:
 --zoom-client-id ID          Zoom Client ID (required for Zoom)
 --zoom-client-secret SECRET  Zoom Client Secret (required for Zoom)
 --days N                     Days to analyze (default: 30, Slack limited to 7 on most plans)
+--no-teamtailor              Skip Teamtailor even if TEAMTAILOR_API_KEY_<WORKSPACE> is set
+--okta-org-url URL           Okta org or custom domain (env: OKTA_ORG_URL)
+--okta-token TOKEN           Okta API token, sent as SSWS (env: OKTA_API_TOKEN)
+--no-okta                    Skip Okta even if OKTA_ORG_URL and OKTA_API_TOKEN are set
 
 # Enrichment Method (required)
 --enrichment spur            Use Spur API for VPN/proxy detection
@@ -181,10 +298,18 @@ saas-enrichment/
 ├── anomaly_detector.py       # Main CLI tool
 ├── extractors/
 │   ├── slack_extractor.py    # Slack API integration
-│   └── zoom_extractor.py     # Zoom API integration
+│   ├── zoom_extractor.py     # Zoom API integration
+│   ├── teamtailor_extractor.py  # Teamtailor ATS audit log (applicant IPs)
+│   └── okta_extractor.py     # Okta System Log (sign-in IPs)
 ├── enrichment/
 │   ├── spur_enrichment.py    # Spur API integration
 │   └── file_enrichment.py    # File-based IP matching
+├── slack_alert_cron.py       # Cron wrapper: new findings -> Slack, Teamtailor profile notes
+├── note_report.py            # Retry profile notes for an already-posted report
+├── user_logins.py            # One Slack user's recent logins, watchlist-flagged
+├── user_check.py             # Per-user IP check
+├── test_*.py                 # Offline unit tests (python -m unittest discover -p 'test_*.py')
+├── AGENTS.md                 # Contributor/agent notes
 ├── reports/                  # Output directory (auto-created)
 ├── examples/                 # Sample outputs
 └── test_credentials.py       # Credential testing tool
@@ -229,6 +354,11 @@ export SLACK_API_TOKEN="xoxp-xxx"
 - **Spur API**: 100 requests/second
 - **Slack API**: ~1 request/second (built-in rate limiting)
 - **Zoom API**: ~3 requests/second (built-in rate limiting)
+- **Teamtailor API**: 50 requests per 10 seconds per token; 429s honour `X-Rate-Limit-Reset`
+- **Okta API**: per-org System Log budget; 429s honour `X-Rate-Limit-Reset` (a Unix timestamp)
+
+Every extractor also retries a stalled request (read timeout or dropped connection) on a
+small separate budget, so one slow response costs a retry rather than the whole source.
 
 ## Performance Optimization
 
